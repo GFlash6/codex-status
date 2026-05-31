@@ -9,7 +9,7 @@ Use this skill to wire Codex hook events to the ESP32 Clawd Mochi Tank firmware.
 
 ## Quick Start
 
-1. Ensure the ESP32 is running the Clawd Mochi Tank firmware and is reachable by HTTP, USB serial, or BLE UART.
+1. Ensure the ESP32 is running the Clawd Mochi Tank firmware and is reachable by BLE UART, CH340 USB serial, or HTTP.
 2. Run `scripts/install_hooks.py` to install Codex hooks into `~/.codex/hooks.json`.
 3. Restart active Codex sessions, then run `/hooks` in the Codex CLI to review and trust the new hook definitions.
 4. Test manually:
@@ -20,13 +20,13 @@ Use this skill to wire Codex hook events to the ESP32 Clawd Mochi Tank firmware.
 Device-side behavior:
 
 ```text
-startup / no Bluetooth client -> beacon
-Bluetooth serial client opens -> idle
-Codex hook command received   -> mapped tank animation
-Bluetooth serial disconnects  -> beacon
+startup / no BLE client -> beacon
+BLE client connects      -> idle
+Codex hook command       -> mapped tank animation
+BLE client disconnects   -> beacon
 ```
 
-The ESP32 returns a JSON state line after serial/Bluetooth serial commands; the hook records it in `~/.clawd-mochi/status-hook.log`.
+The ESP32 exposes Nordic UART Service BLE (`6e400001-b5a3-f393-e0a9-e50e24dcca9e`) and returns JSON state notifications; the hook records transport results in `~/.clawd-mochi/status-hook.log`.
 
 Check whether the skill can find the device by itself:
 
@@ -34,7 +34,7 @@ Check whether the skill can find the device by itself:
 python skills/codex-clawd-status/scripts/codex_clawd_hook.py --doctor
 ```
 
-Default transport is fallback mode: serial/Bluetooth COM first, then HTTP. Set `CLAWD_TANK_URL` to override the default HTTP device URL:
+Default transport is fallback mode: BLE GATT first, then auto-detected CH340 USB serial, then HTTP. Set `CLAWD_TANK_URL` to override the default HTTP device URL:
 
 ```powershell
 $env:CLAWD_TANK_URL="http://192.168.4.1"
@@ -44,21 +44,19 @@ Use serial only:
 
 ```powershell
 $env:CLAWD_TANK_TRANSPORT="serial"
-$env:CLAWD_TANK_SERIAL_PORT="COM5"
 python skills/codex-clawd-status/scripts/codex_clawd_hook.py --test typing
 ```
 
-Use Bluetooth serial instead:
+The serial transport auto-detects the CH340/CH341 adapter from pyserial port metadata. Set `CLAWD_TANK_SERIAL_PORT` only when you intentionally want to override auto-detection.
+
+Use BLE only:
 
 ```powershell
-$env:CLAWD_TANK_TRANSPORT="bluetooth"
-$env:CLAWD_TANK_SERIAL_PORT="COM5"
+$env:CLAWD_TANK_TRANSPORT="ble"
 python skills/codex-clawd-status/scripts/codex_clawd_hook.py --test typing
 ```
 
-The current ESP32 firmware advertises as Windows-visible classic Bluetooth SPP. Pair `Claude-Mochi-Tank` in Windows Bluetooth settings first, then use the outgoing COM port shown in Windows. Serial/Bluetooth serial requires `pyserial`.
-
-If `CLAWD_TANK_SERIAL_PORT` is not set, the hook tries to auto-detect a CH340 USB serial adapter first, then a Windows COM port whose device name contains `Claude-Mochi-Tank`.
+BLE mode requires `bleak`. The current ESP32 firmware advertises as `Claude-Mochi-Tank` and accepts newline-terminated JSON on the Nordic UART RX characteristic.
 
 Send through every channel instead of stopping after the first success:
 
@@ -69,9 +67,9 @@ $env:CLAWD_TANK_TRANSPORT="parallel"
 Accepted transport values:
 
 ```text
-auto        serial/Bluetooth COM -> HTTP fallback, this is the default
-parallel    send by serial, BLE, and HTTP
-bluetooth   Bluetooth serial only, alias of serial
+auto        BLE -> CH340 serial -> HTTP fallback, this is the default
+parallel    send by BLE, CH340 serial, and HTTP
+bluetooth   BLE GATT only, alias of ble
 serial      serial only
 ble         BLE GATT only, for firmware that uses Nordic UART Service
 http        HTTP only

@@ -12,7 +12,6 @@ import argparse
 import asyncio
 import json
 import os
-import re
 import subprocess
 import sys
 import time
@@ -195,14 +194,14 @@ def transport_list(selected: str) -> list[str]:
     aliases = {
         "all": "parallel",
         "fallback": "auto",
-        "bt": "serial",
-        "bluetooth": "serial",
+        "bt": "ble",
+        "bluetooth": "ble",
     }
     selected = aliases.get(selected, selected)
     if selected == "auto":
-        return ["serial", "http"]
+        return ["ble", "serial", "http"]
     if selected == "parallel":
-        return ["serial", "ble", "http"]
+        return ["ble", "serial", "http"]
     if "," in selected:
         return [item.strip().lower() for item in selected.split(",") if item.strip()]
     return [selected]
@@ -212,48 +211,30 @@ def command_payload(anim: str) -> str:
     return json.dumps({"auto": False, "anim": anim}, separators=(",", ":")) + "\n"
 
 
-def discover_windows_bluetooth_port(device_name: str = DEFAULT_BLE_NAME) -> str | None:
-    ports = discover_windows_bluetooth_ports(device_name)
-    return ports[0] if ports else None
-
-
-def discover_windows_bluetooth_ports(device_name: str = DEFAULT_BLE_NAME) -> list[str]:
-    if os.name != "nt":
-        return []
-
-    script = (
-        "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
-        "Get-PnpDevice -Class Ports -PresentOnly | "
-        f"Where-Object {{$_.FriendlyName -like '*{device_name}*'}} | "
-        "Select-Object -ExpandProperty FriendlyName"
+def port_matches_ch340(info: object) -> bool:
+    """Match CH340/CH341 across pyserial's available metadata fields."""
+    if getattr(info, "vid", None) == CH340_VID:
+        return True
+    fields = (
+        "device",
+        "name",
+        "description",
+        "hwid",
+        "manufacturer",
+        "product",
+        "interface",
+        "location",
     )
-    try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", script],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=1.5,
-            check=False,
-        )
-    except Exception as exc:
-        log(f"bluetooth COM discovery failed: {exc}")
-        return []
-
-    return re.findall(r"\((COM\d+)\)", result.stdout)
+    haystack = " ".join(str(getattr(info, field, "") or "") for field in fields).upper()
+    return any(token in haystack for token in ("CH340", "CH341", "1A86", "USB-SERIAL"))
 
 
 def discover_ch340_port() -> str | None:
-    """Return the first serial port whose USB VID matches CH340 (0x1A86)."""
+    """Return the serial port field for the first detected CH340/CH341 adapter."""
     try:
         from serial.tools import list_ports  # type: ignore
         for info in list_ports.comports():
-            if info.vid == CH340_VID:
-                return info.device
-        # Fallback: match by description string for systems where VID is unavailable
-        for info in list_ports.comports():
-            if "CH340" in (info.description or "") or "CH341" in (info.description or ""):
+            if port_matches_ch340(info):
                 return info.device
     except Exception:
         pass
@@ -287,16 +268,11 @@ def doctor() -> int:
     ch340 = discover_ch340_port()
     print(f"CH340 auto-detect: {ch340 or 'none'}")
 
-    ports = discover_windows_bluetooth_ports()
-    if ports:
-        print(f"bluetooth COM candidates for {DEFAULT_BLE_NAME}: {', '.join(ports)}")
-    else:
-        print(f"bluetooth COM candidates for {DEFAULT_BLE_NAME}: none")
-        all_ports = list_windows_ports()
-        if all_ports:
-            print("present Windows serial ports:")
-            for item in all_ports:
-                print(f"  {item}")
+    all_ports = list_windows_ports()
+    if all_ports:
+        print("present Windows serial ports:")
+        for item in all_ports:
+            print(f"  {item}")
 
     try:
         import serial  # noqa: F401  # type: ignore
@@ -336,7 +312,6 @@ def send_anim_serial(anim: str, port: str | None = None, baud: int | None = None
         port
         or os.environ.get("CLAWD_TANK_SERIAL_PORT")
         or discover_ch340_port()
-        or discover_windows_bluetooth_port()
     )
     if not serial_port:
         log("serial transport selected but no COM port was found; set CLAWD_TANK_SERIAL_PORT/--port")
@@ -603,7 +578,7 @@ def main() -> int:
     parser.add_argument("--doctor", action="store_true", help="show discovered transports and dependencies")
     parser.add_argument("--print-mapping", action="store_true")
     parser.add_argument("--transport", help="http, serial, ble, auto, parallel/all, or comma list")
-    parser.add_argument("--port", help="serial port, for example COM5")
+    parser.add_argument("--port", help="optional serial port override; CH340 is auto-detected when omitted")
     parser.add_argument("--baud", type=int, default=None)
     parser.add_argument("--ble-address")
     parser.add_argument("--ble-name", default=None)

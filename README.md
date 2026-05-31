@@ -56,15 +56,15 @@ Start-Process -FilePath "C:\Python314\python.exe" `
   -ArgumentList @(
     "skills/codex-clawd-status/scripts/codex_session_watch.py",
     "--follow-latest",
-    "--transport", "serial",
-    "--port", "COM5"
+    "--transport", "ble"
   ) `
   -WindowStyle Hidden
 ```
 
 The watcher uses the same animation mapping and transport code as the hook
-script, but reads Codex's session event log directly. Omit `--port` to use
-auto-detected CH340 serial.
+script, but reads Codex's session event log directly. Use `--transport serial`
+only when you want CH340 USB serial fallback; the port is auto-detected from
+CH340/CH341 metadata.
 
 `codex_clawd_hook.py` also auto-starts this watcher the first time a real hook
 payload arrives. Disable that behavior with:
@@ -78,11 +78,10 @@ start the watcher directly in that case.
 
 ## Transport Configuration
 
-Default priority is CH340 USB serial, then Bluetooth serial, then HTTP `192.168.4.1`.
+Default priority is BLE GATT, then auto-detected CH340 USB serial, then HTTP `192.168.4.1`.
 
 ```powershell
-$env:CLAWD_TANK_SERIAL_PORT = "COM3"
-$env:CLAWD_TANK_TRANSPORT = "serial"
+$env:CLAWD_TANK_TRANSPORT = "ble"
 $env:CLAWD_DEBUG = "1"
 ```
 
