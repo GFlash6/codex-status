@@ -293,7 +293,7 @@ def send_anim_hub(anim: str, args: argparse.Namespace, payload: dict | None = No
         method="POST",
     )
     try:
-        with hub_urlopen(req, timeout=5.0) as resp:
+        with hub_urlopen(req, timeout=12.0) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             ok = bool(data.get("ok"))
             log(f"hub delivery anim={anim} ok={ok} status={data.get('status')}")

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: latin-1 -*-
 """Local Clawd hook hub with a small visual dashboard.
 
 The hub accepts Codex/Claude hook deliveries on /hook, keeps transport state,
@@ -33,6 +34,17 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 
 
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+IDLE_KEEPALIVE_AFTER_S = env_float("CLAWD_TANK_IDLE_KEEPALIVE_AFTER", 15.0)
+IDLE_KEEPALIVE_INTERVAL_S = env_float("CLAWD_TANK_IDLE_KEEPALIVE_INTERVAL", 8.0)
+
+
 def import_bridge():
     for name in ("codex_clawd_hook", "claude_clawd_hook"):
         try:
@@ -43,6 +55,7 @@ def import_bridge():
 
 
 bridge = import_bridge()
+IDLE_KEEPALIVE_ANIM = os.environ.get("CLAWD_TANK_IDLE_KEEPALIVE_ANIM", bridge.SLEEP_ANIM)
 
 
 def now_iso() -> str:
@@ -131,6 +144,7 @@ class BleSession:
         self.address = address
         self.client: Any = None
         self.target: str | None = address
+        self.send_lock = threading.Lock()
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
@@ -139,19 +153,22 @@ class BleSession:
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
 
-    def send(self, anim: str, timeout: float = 8.0) -> tuple[bool, str]:
-        fut = asyncio.run_coroutine_threadsafe(self._send(anim), self.loop)
-        try:
-            return fut.result(timeout=timeout)
-        except Exception as exc:
-            return False, str(exc)
+    def send(self, anim: str, timeout: float = 12.0) -> tuple[bool, str]:
+        with self.send_lock:
+            fut = asyncio.run_coroutine_threadsafe(self._send(anim), self.loop)
+            try:
+                return fut.result(timeout=timeout)
+            except Exception as exc:
+                self.client = None
+                return False, str(exc)
 
     def scan(self, timeout: float = 6.0) -> tuple[bool, list[dict[str, Any]] | str]:
-        fut = asyncio.run_coroutine_threadsafe(self._scan(), self.loop)
-        try:
-            return True, fut.result(timeout=timeout)
-        except Exception as exc:
-            return False, str(exc)
+        with self.send_lock:
+            fut = asyncio.run_coroutine_threadsafe(self._scan(), self.loop)
+            try:
+                return True, fut.result(timeout=timeout)
+            except Exception as exc:
+                return False, str(exc)
 
     def select(self, address: str, name: str | None = None) -> None:
         self.target = address.strip() or None
@@ -182,8 +199,44 @@ class BleSession:
                     "suggested": bool(name and name.startswith(self.name)),
                 }
             )
+        if self.target and not any(row["address"] == self.target for row in rows):
+            rows.append(
+                {
+                    "address": self.target,
+                    "name": self.name or "selected BLE device",
+                    "rssi": None,
+                    "selected": True,
+                    "suggested": True,
+                }
+            )
         rows.sort(key=lambda item: (not item["suggested"], item["name"] or "", item["address"]))
         return rows
+
+    async def _disconnect(self) -> None:
+        client = self.client
+        self.client = None
+        if client is None:
+            return
+        try:
+            if client.is_connected:
+                await client.disconnect()
+        except Exception:
+            pass
+
+    async def _send_once(self, anim: str) -> tuple[bool, str]:
+        from bleak import BleakClient  # type: ignore
+        if self.client is None or not self.client.is_connected:
+            self.client = BleakClient(self.target, timeout=5.0)
+            await asyncio.wait_for(self.client.connect(), timeout=6.0)
+        await asyncio.wait_for(
+            self.client.write_gatt_char(
+                bridge.BLE_RX_UUID,
+                bridge.command_payload(anim).encode("utf-8"),
+                response=False,
+            ),
+            timeout=3.0,
+        )
+        return True, f"BLE {self.target}"
 
     async def _send(self, anim: str) -> tuple[bool, str]:
         try:
@@ -200,25 +253,25 @@ class BleSession:
         if not self.target:
             return False, f"BLE device not found name={self.name!r}"
 
-        try:
-            if self.client is None or not self.client.is_connected:
-                self.client = BleakClient(self.target, timeout=5.0)
-                await self.client.connect()
-            await self.client.write_gatt_char(
-                bridge.BLE_RX_UUID,
-                bridge.command_payload(anim).encode("utf-8"),
-                response=False,
-            )
-            return True, f"BLE {self.target}"
-        except Exception as exc:
-            self.client = None
-            return False, f"BLE failed: {exc}"
+        errors: list[str] = []
+        for attempt in range(2):
+            try:
+                ok, message = await self._send_once(anim)
+                return ok, message
+            except Exception as exc:
+                detail = str(exc) or exc.__class__.__name__
+                errors.append(detail)
+                await self._disconnect()
+                if attempt == 0:
+                    await asyncio.sleep(0.35)
+        return False, "BLE failed: " + "; retry: ".join(errors)
 
 
 class HubState:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.lock = threading.Lock()
+        self.started_at_ts = time.time()
         self.events: list[dict[str, Any]] = []
         self.hooks: dict[str, dict[str, Any]] = {}
         self.clients: dict[str, dict[str, Any]] = {}
@@ -241,6 +294,50 @@ class HubState:
             "failed_count": 0,
         }
         self.ble = BleSession(args.ble_name, args.ble_address)
+        self.last_keepalive_at = 0.0
+        self.keepalive_thread = threading.Thread(target=self._idle_keepalive_loop, daemon=True)
+        self.keepalive_thread.start()
+
+    def _idle_keepalive_loop(self) -> None:
+        while True:
+            time.sleep(1.0)
+            now = time.time()
+            with self.lock:
+                last_activity = float(self.state.get("last_hook_at") or self.started_at_ts)
+                last_send = max(float(self.last_keepalive_at), last_activity)
+            if now - last_activity < IDLE_KEEPALIVE_AFTER_S:
+                continue
+            if now - last_send < IDLE_KEEPALIVE_INTERVAL_S:
+                continue
+            started = time.perf_counter()
+            ok, message = self.ble.send(IDLE_KEEPALIVE_ANIM)
+            elapsed_ms = round((time.perf_counter() - started) * 1000)
+            with self.lock:
+                self.last_keepalive_at = now
+                self.transports["ble"] = {
+                    "status": "delivered" if ok else "failed",
+                    "message": message,
+                    "last_at": now,
+                }
+                self.state.update(
+                    {
+                        "current_anim": IDLE_KEEPALIVE_ANIM,
+                        "current_source": "keepalive",
+                        "current_client_id": "hub",
+                        "current_client_kind": "hub",
+                        "current_event": "IdleKeepalive",
+                        "current_tool": "",
+                        "transport": "ble" if ok else None,
+                        "transport_status": "delivered" if ok else "failed",
+                        "transport_message": message,
+                        "last_send_ms": elapsed_ms,
+                        "last_error": None if ok else message,
+                    }
+                )
+            if ok:
+                log(f"idle keepalive anim={IDLE_KEEPALIVE_ANIM} {message}")
+            else:
+                log(f"idle keepalive failed anim={IDLE_KEEPALIVE_ANIM}: {message}")
 
     def scan_serial(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -314,7 +411,16 @@ class HubState:
         old_pid = read_pid(WATCH_PID_PATH)
         stop_pid(old_pid)
         time.sleep(0.3)
-        proc = subprocess.Popen([sys.executable, str(watcher), "--follow-latest"], **process_kwargs())
+        cmd = [sys.executable, str(watcher), "--follow-latest", "--transport", str(self.args.transport)]
+        if self.args.port:
+            cmd += ["--port", str(self.args.port)]
+        if self.args.baud is not None:
+            cmd += ["--baud", str(self.args.baud)]
+        if self.ble.target:
+            cmd += ["--ble-address", str(self.ble.target)]
+        if self.ble.name:
+            cmd += ["--ble-name", str(self.ble.name)]
+        proc = subprocess.Popen(cmd, **process_kwargs())
         log(f"module restart codex-watcher old_pid={old_pid} new_pid={proc.pid}")
         return {"ok": True, "module": "codex-watcher", "pid": proc.pid}
 
@@ -674,15 +780,15 @@ async function send(anim){await fetch('/send',{method:'POST',headers:{'content-t
 async function post(url,body){return await (await fetch(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body||{})})).json();}
 function cls(s){return ["delivered","online","available","configured","selected"].includes(s)?"ok":["failed","offline","missing"].includes(s)?"bad":s==="sending"?"send":"muted"}
 function pill(s){return `<span class="pill ${cls(s)}">${s||"idle"}</span>`}
-function meta(l,v){const t=(v===0?"0":v||"").toString().replace(/"/g,"");return `<div class="meta"><span class="ml">${l}</span><span class="mv" title="${t}">${(v===0?"0":v)||"â€?}</span></div>`}
+function meta(l,v){const t=(v===0?"0":v||"").toString().replace(/"/g,"");return `<div class="meta"><span class="ml">${l}</span><span class="mv" title="${t}">${(v===0?"0":v)||""}</span></div>`}
 function none(t){return `<tr><td class="empty" colspan="9">${t}</td></tr>`}
 async function scanSerial(){
-  selectors.innerHTML='<p class="muted">Scanning serialâ€?/p>';
+  selectors.innerHTML='<p class="muted">Scanning serial...</p>';
   const rows=await (await fetch('/scan/serial')).json();
   selectors.innerHTML='<div class="sub">Serial</div>'+rows.map(r=>r.error?`<p class=bad>${r.error}</p>`:`<p><button class="btn" onclick="selectSerial('${r.device}')">Use</button> <b>${r.device}</b> ${r.suggested?'<span class=ok>CH340</span> ':''}<span class="mono">${r.description||''} ${r.hwid||''}</span></p>`).join('')+'<button class="btn" onclick="selectSerial(null)">Auto serial</button>';
 }
 async function scanBle(){
-  selectors.innerHTML='<p class="muted">Scanning BLEâ€?/p>';
+  selectors.innerHTML='<p class="muted">Scanning BLE...</p>';
   const data=await (await fetch('/scan/ble')).json();
   if(!data.ok){selectors.innerHTML=`<p class=bad>${data.error}</p>`;return}
   selectors.innerHTML='<div class="sub">BLE</div>'+data.devices.map(r=>`<p><button class="btn" onclick="selectBle('${r.address}','${(r.name||'').replaceAll("'","")}')">Use</button> <b>${r.name||'(unnamed)'}</b> <span class="mono">${r.address} ${r.rssi??''}</span> ${r.suggested?'<span class=ok>target</span>':''}</p>`).join('');
@@ -812,4 +918,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
