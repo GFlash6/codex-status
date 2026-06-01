@@ -1,0 +1,5 @@
+pyserial>=3.5
+bleak>=0.21.0
+Pillow>=10.0.0
+rumps>=0.4.0
+

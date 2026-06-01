@@ -25,6 +25,31 @@ SESSIONS_DIR = CODEX_HOME / "sessions"
 WATCH_PID_PATH = hook.LOG_DIR / "session-watch.pid"
 
 
+def originator_client_id(originator: str, source: str, fallback: str) -> str:
+    text = f"{originator} {source}".lower()
+    if "desktop" in text:
+        return "codex-desktop"
+    if "vscode" in text or "vs code" in text:
+        return "codex-vscode"
+    return fallback
+
+
+def session_client_id(path: Path, fallback: str) -> str:
+    try:
+        first = path.open("r", encoding="utf-8", errors="replace").readline()
+        item = json.loads(first)
+    except (OSError, json.JSONDecodeError):
+        return fallback
+    if not isinstance(item, dict) or item.get("type") != "session_meta":
+        return fallback
+    payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+    return originator_client_id(
+        str(payload.get("originator") or ""),
+        str(payload.get("source") or ""),
+        fallback,
+    )
+
+
 def latest_session_file() -> Path | None:
     try:
         files = [p for p in SESSIONS_DIR.rglob("*.jsonl") if p.is_file()]
@@ -78,20 +103,16 @@ def item_to_anim(item: dict[str, Any]) -> tuple[str | None, str]:
 def send_watched_anim(anim: str, reason: str, args: argparse.Namespace) -> None:
     event_time = hook.touch_last_event()
     hook.log(f"watch mapped {reason} anim={anim}")
-    hook.send_anim(
-        anim,
-        transport=args.transport,
-        port=args.port,
-        baud=args.baud,
-        ble_address=args.ble_address,
-        ble_name=args.ble_name,
-    )
+    payload = {"hook_event_name": "SessionWatch", "tool_name": reason}
+    hook.deliver_anim(anim, args, payload=payload, event_time=event_time)
     if anim == hook.TASK_COMPLETE_ANIM:
         hook.spawn_timed_transition(event_time, args)
 
 
 def follow_file(path: Path, args: argparse.Namespace) -> None:
-    hook.log(f"watch following session={path}")
+    session_args = argparse.Namespace(**vars(args))
+    session_args.client_id = session_client_id(path, args.client_id)
+    hook.log(f"watch following session={path} client_id={session_args.client_id}")
     with path.open("r", encoding="utf-8", errors="replace") as fh:
         if not args.replay:
             fh.seek(0, os.SEEK_END)
@@ -114,7 +135,7 @@ def follow_file(path: Path, args: argparse.Namespace) -> None:
                 continue
             anim, reason = item_to_anim(item)
             if anim:
-                send_watched_anim(anim, reason, args)
+                send_watched_anim(anim, reason, session_args)
 
 
 def write_pid() -> None:
@@ -136,6 +157,10 @@ def main() -> int:
     parser.add_argument("--baud", type=int, default=None)
     parser.add_argument("--ble-address")
     parser.add_argument("--ble-name", default=None)
+    parser.add_argument("--hub-url", default=None)
+    parser.add_argument("--no-hub", action="store_true")
+    parser.add_argument("--hub-required", action="store_true")
+    parser.add_argument("--client-id", default=os.environ.get("CLAWD_TANK_WATCH_CLIENT_ID", "codex-watch"))
     args = parser.parse_args()
 
     write_pid()
