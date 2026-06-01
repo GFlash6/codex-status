@@ -674,15 +674,15 @@ async function send(anim){await fetch('/send',{method:'POST',headers:{'content-t
 async function post(url,body){return await (await fetch(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body||{})})).json();}
 function cls(s){return ["delivered","online","available","configured","selected"].includes(s)?"ok":["failed","offline","missing"].includes(s)?"bad":s==="sending"?"send":"muted"}
 function pill(s){return `<span class="pill ${cls(s)}">${s||"idle"}</span>`}
-function meta(l,v){const t=(v===0?"0":v||"").toString().replace(/"/g,"");return `<div class="meta"><span class="ml">${l}</span><span class="mv" title="${t}">${(v===0?"0":v)||"â€?}</span></div>`}
+function meta(l,v){const t=(v===0?"0":v||"").toString().replace(/"/g,"");return `<div class="meta"><span class="ml">${l}</span><span class="mv" title="${t}">${(v===0?"0":v)||""}</span></div>`}
 function none(t){return `<tr><td class="empty" colspan="9">${t}</td></tr>`}
 async function scanSerial(){
-  selectors.innerHTML='<p class="muted">Scanning serialâ€?/p>';
+  selectors.innerHTML='<p class="muted">Scanning serial...</p>';
   const rows=await (await fetch('/scan/serial')).json();
   selectors.innerHTML='<div class="sub">Serial</div>'+rows.map(r=>r.error?`<p class=bad>${r.error}</p>`:`<p><button class="btn" onclick="selectSerial('${r.device}')">Use</button> <b>${r.device}</b> ${r.suggested?'<span class=ok>CH340</span> ':''}<span class="mono">${r.description||''} ${r.hwid||''}</span></p>`).join('')+'<button class="btn" onclick="selectSerial(null)">Auto serial</button>';
 }
 async function scanBle(){
-  selectors.innerHTML='<p class="muted">Scanning BLEâ€?/p>';
+  selectors.innerHTML='<p class="muted">Scanning BLE...</p>';
   const data=await (await fetch('/scan/ble')).json();
   if(!data.ok){selectors.innerHTML=`<p class=bad>${data.error}</p>`;return}
   selectors.innerHTML='<div class="sub">BLE</div>'+data.devices.map(r=>`<p><button class="btn" onclick="selectBle('${r.address}','${(r.name||'').replaceAll("'","")}')">Use</button> <b>${r.name||'(unnamed)'}</b> <span class="mono">${r.address} ${r.rssi??''}</span> ${r.suggested?'<span class=ok>target</span>':''}</p>`).join('');
@@ -699,7 +699,7 @@ async function refresh(){
   const s=await (await fetch('/state')).json();
   status.textContent=s.transport_status||"idle"; status.className="pill "+cls(s.transport_status);
   current.innerHTML=`<div class="hero"><div class="hero-anim">${s.current_anim||"idle"}</div>${pill(s.transport_status)}</div>`+
-    `<div class="metas">`+meta("client",(s.current_client_id||"")+(s.current_client_kind?" Â· "+s.current_client_kind:""))+meta("source",s.current_source)+meta("event",s.current_event)+meta("tool",s.current_tool)+`</div>`;
+    `<div class="metas">`+meta("client",(s.current_client_id||"")+(s.current_client_kind?" / "+s.current_client_kind:""))+meta("source",s.current_source)+meta("event",s.current_event)+meta("tool",s.current_tool)+`</div>`;
   document.querySelectorAll('#buttons .chip').forEach(b=>b.classList.toggle('active',b.dataset.a===s.current_anim));
   const me=Object.entries(s.modules||{});
   modules.innerHTML='<tr><th>Module</th><th>Status</th><th>Detail</th><th></th></tr>'+(me.length?me.map(([k,v])=>`<tr><td>${v.label||k}</td><td>${pill(v.status)}</td><td class="muted">${v.detail||""}</td><td>${v.restartable?`<button class="btn" onclick="restartModule('${k}')">Restart</button>`:""}</td></tr>`).join(""):none("no modules"));
