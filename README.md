@@ -28,6 +28,21 @@ Then restart Codex and run `/hooks` to review and trust hook definitions.
 
 ## Daily Start
 
+Start the background UI controller:
+
+```powershell
+Start-Process -FilePath "C:\Python314\python.exe" `
+  -ArgumentList @(
+    "C:\Users\admin\.codex\skills\codex-clawd-status\scripts\clawd_hub_app.py",
+    "--minimized"
+  ) `
+  -WindowStyle Hidden
+```
+
+The UI controller keeps Hub and the Codex watcher alive, provides restart
+buttons, and opens the dashboard. If `pystray` is installed it lives in the
+system tray; otherwise it uses a small Tkinter window.
+
 Start Hub:
 
 ```powershell

@@ -48,6 +48,7 @@ Important scripts:
 
 ```text
 scripts/install_hooks.py         writes ~/.codex/hooks.json
+scripts/clawd_hub_app.py         background UI controller for Hub/watchers
 scripts/codex_clawd_hook.py      handles native Codex hook payloads
 scripts/codex_session_watch.py   tails ~/.codex/sessions/**/*.jsonl
 scripts/clawd_status_hub.py      visual relay and transport owner
@@ -101,6 +102,22 @@ Runtime state and logs:
 ## Daily Start
 
 The most reliable daily setup is to keep both Hub and watcher running.
+
+Start the background UI controller:
+
+```powershell
+Start-Process -FilePath "C:\Python314\python.exe" `
+  -ArgumentList @(
+    "C:\Users\admin\.codex\skills\codex-clawd-status\scripts\clawd_hub_app.py",
+    "--minimized"
+  ) `
+  -WindowStyle Hidden
+```
+
+The UI controller keeps Hub and the Codex watcher alive, shows module status,
+opens the dashboard, and can restart Hub, watcher, or BLE from a small window.
+If `pystray` is installed it can stay in the Windows system tray; without
+`pystray` it falls back to Tkinter minimize behavior.
 
 Start the Hub:
 
