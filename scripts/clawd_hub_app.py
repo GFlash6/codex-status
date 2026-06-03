@@ -77,7 +77,30 @@ class HubController:
     def modules(self) -> dict[str, Any]:
         return http_json(self.hub_url + "/modules", timeout=2.0)
 
+    def cleanup_duplicate_hubs(self) -> None:
+        if os.name != "nt":
+            return
+        try:
+            script = (
+                "$listener=(Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction SilentlyContinue | "
+                "Select-Object -First 1 -ExpandProperty OwningProcess);"
+                "$hubs=Get-CimInstance Win32_Process | Where-Object { "
+                "$_.Name -eq 'python.exe' -and $_.CommandLine -like '*clawd_status_hub.py*' };"
+                "foreach($h in $hubs){ if($listener -and $h.ProcessId -ne $listener){ "
+                "Stop-Process -Id $h.ProcessId -Force -ErrorAction SilentlyContinue } }"
+            )
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3.0,
+                check=False,
+            )
+        except Exception:
+            pass
+
     def ensure_hub(self) -> None:
+        self.cleanup_duplicate_hubs()
         try:
             self.health()
             return
@@ -270,7 +293,7 @@ def status_json(controller: HubController) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--hub-url", default=os.environ.get("CLAWD_TANK_HUB_URL", DEFAULT_HUB_URL))
-    parser.add_argument("--transport", default=os.environ.get("CLAWD_TANK_TRANSPORT", "auto"))
+    parser.add_argument("--transport", default=os.environ.get("CLAWD_TANK_TRANSPORT", "ble"))
     parser.add_argument("--minimized", action="store_true")
     parser.add_argument("--status", action="store_true", help="start/check Hub and print module JSON")
     args = parser.parse_args()

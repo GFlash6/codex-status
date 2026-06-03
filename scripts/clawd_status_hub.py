@@ -129,8 +129,11 @@ class BleSession:
     def __init__(self, name: str, address: str | None) -> None:
         self.name = name
         self.address = address
+        self.sticky_address = bool(address)
         self.client: Any = None
+        self.target_device: Any = None
         self.target: str | None = address
+        self.send_guard = threading.Lock()
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
@@ -139,12 +142,22 @@ class BleSession:
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
 
-    def send(self, anim: str, timeout: float = 8.0) -> tuple[bool, str]:
-        fut = asyncio.run_coroutine_threadsafe(self._send(anim), self.loop)
-        try:
-            return fut.result(timeout=timeout)
-        except Exception as exc:
-            return False, str(exc)
+    def send(self, anim: str, timeout: float = 18.0) -> tuple[bool, str]:
+        # Codex can emit several hook/session events in the same second. Windows
+        # BLE is not happy when multiple writes race the same BleakClient, so
+        # serialize sends before they enter the asyncio loop.
+        with self.send_guard:
+            fut = asyncio.run_coroutine_threadsafe(self._send(anim), self.loop)
+            try:
+                return fut.result(timeout=timeout)
+            except TimeoutError:
+                self.client = None
+                self.target_device = None
+                return False, f"BLE send timed out while looking for {self.name!r}"
+            except Exception as exc:
+                self.client = None
+                self.target_device = None
+                return False, str(exc) or exc.__class__.__name__
 
     def scan(self, timeout: float = 6.0) -> tuple[bool, list[dict[str, Any]] | str]:
         fut = asyncio.run_coroutine_threadsafe(self._scan(), self.loop)
@@ -154,14 +167,17 @@ class BleSession:
             return False, str(exc)
 
     def select(self, address: str, name: str | None = None) -> None:
-        self.target = address.strip() or None
-        self.address = self.target
+        self.address = address.strip() or None
+        self.sticky_address = bool(self.address)
+        self.target = self.address
         if name:
             self.name = name
         self.client = None
+        self.target_device = None
 
     def reset(self) -> None:
         self.client = None
+        self.target_device = None
 
     async def _scan(self) -> list[dict[str, Any]]:
         try:
@@ -173,17 +189,50 @@ class BleSession:
         for key, value in devices.items():
             device, adv = value
             name = device.name or getattr(adv, "local_name", "") or ""
+            suggested = bool(name == self.name)
             rows.append(
                 {
                     "address": device.address,
                     "name": name,
                     "rssi": getattr(adv, "rssi", None),
                     "selected": device.address == self.target,
-                    "suggested": bool(name and name.startswith(self.name)),
+                    "suggested": suggested,
                 }
             )
         rows.sort(key=lambda item: (not item["suggested"], item["name"] or "", item["address"]))
         return rows
+
+    async def _find_device(self, BleakScanner: Any, timeout: float = 8.0) -> Any | None:
+        # Only an explicitly selected address is treated as sticky. Addresses
+        # discovered during BLE scans can be random/private and must not become
+        # the next startup's hard-coded target.
+        target_upper = (self.address or "").upper() if self.sticky_address else ""
+        devices = await BleakScanner.discover(timeout=timeout, return_adv=True)
+        exact_address = None
+        suggested = None
+        for _key, value in devices.items():
+            device, adv = value
+            name = device.name or getattr(adv, "local_name", "") or ""
+            if target_upper and device.address.upper() == target_upper:
+                exact_address = device
+                break
+            if not suggested and name == self.name:
+                suggested = device
+        device = exact_address or suggested
+        if device is not None:
+            self.target = device.address
+            self.target_device = device
+        return device
+
+    async def _disconnect_client(self) -> None:
+        client = self.client
+        self.client = None
+        self.target_device = None
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
 
     async def _send(self, anim: str) -> tuple[bool, str]:
         try:
@@ -191,27 +240,30 @@ class BleSession:
         except ImportError:
             return False, "bleak missing; install with: python -m pip install bleak"
 
-        if not self.target:
-            devices = await BleakScanner.discover(timeout=2.5)
-            for device in devices:
-                if (device.name or "").startswith(self.name):
-                    self.target = device.address
-                    break
-        if not self.target:
-            return False, f"BLE device not found name={self.name!r}"
-
         try:
             if self.client is None or not self.client.is_connected:
-                self.client = BleakClient(self.target, timeout=5.0)
+                device = await self._find_device(BleakScanner)
+                if device is None:
+                    address_hint = self.address if self.sticky_address else ""
+                    return False, f"BLE device not found name={self.name!r} address={address_hint}"
+                self.client = BleakClient(device, timeout=8.0)
                 await self.client.connect()
+                try:
+                    get_services = getattr(self.client, "get_services", None)
+                    if get_services is not None:
+                        await get_services()
+                    else:
+                        _ = self.client.services
+                except Exception:
+                    pass
             await self.client.write_gatt_char(
                 bridge.BLE_RX_UUID,
                 bridge.command_payload(anim).encode("utf-8"),
-                response=False,
+                response=True,
             )
             return True, f"BLE {self.target}"
         except Exception as exc:
-            self.client = None
+            await self._disconnect_client()
             return False, f"BLE failed: {exc}"
 
 
@@ -276,7 +328,7 @@ class HubState:
             "serial_port": self.args.port,
             "baud": self.args.baud,
             "ble_name": self.ble.name,
-            "ble_address": self.ble.target,
+            "ble_address": self.ble.address if self.ble.sticky_address else None,
         }
 
     def update_config(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -356,8 +408,8 @@ class HubState:
             cmd += ["--serial-port", str(self.args.port)]
         if self.args.baud is not None:
             cmd += ["--baud", str(self.args.baud)]
-        if self.ble.target:
-            cmd += ["--ble-address", str(self.ble.target)]
+        if self.ble.sticky_address and self.ble.address:
+            cmd += ["--ble-address", str(self.ble.address)]
         if self.ble.name:
             cmd += ["--ble-name", str(self.ble.name)]
 
@@ -812,4 +864,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
