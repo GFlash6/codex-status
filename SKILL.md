@@ -83,6 +83,20 @@ Runtime state and logs:
    python skills/codex-clawd-status/scripts/install_hooks.py
    ```
 
+   The installer also creates or updates this Windows Startup shortcut:
+
+   ```text
+   %APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\Clawd Hub App.lnk
+   ```
+
+   The shortcut starts `clawd_hub_app.py --minimized` at login, so Hub and
+   the watcher can stay available in the background. To install hooks without
+   changing Startup entries, run:
+
+   ```powershell
+   python scripts/install_hooks.py --no-startup
+   ```
+
 3. Restart active Codex sessions.
 
 4. In Codex CLI, run:
@@ -100,6 +114,9 @@ Runtime state and logs:
    ```
 
 ## Daily Start
+
+After installation on Windows, the Hub UI controller is started automatically
+at login from the `Clawd Hub App.lnk` Startup shortcut.
 
 The most reliable daily setup is to keep both Hub and watcher running.
 

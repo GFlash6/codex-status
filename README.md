@@ -24,9 +24,16 @@ Codex native hooks and/or Codex session JSONL watcher
 C:\Python314\python.exe C:\Users\admin\.codex\skills\codex-clawd-status\scripts\install_hooks.py
 ```
 
+The installer writes Codex hooks and creates or updates the Windows Startup
+shortcut `Clawd Hub App.lnk`, which starts `clawd_hub_app.py --minimized` at
+login. Use `--no-startup` if you only want to refresh hook entries.
+
 Then restart Codex and run `/hooks` to review and trust hook definitions.
 
 ## Daily Start
+
+On Windows this is normally automatic after install because the Startup
+shortcut launches the background UI controller at login.
 
 Start the background UI controller:
 
