@@ -14,11 +14,13 @@ Common Codex fields:
 - `permission_mode`: `default`, `acceptEdits`, `plan`, `dontAsk`, or `bypassPermissions`
 - `agent_id` / `agent_type`: subagent identifiers for subagent hooks
 
-Animation endpoint:
+Device command:
 
 ```text
-GET http://192.168.4.1/anim?id=<animation>
+{"auto":false,"anim":"<animation>"}
 ```
+
+The command is sent as newline-terminated JSON over BLE Nordic UART or serial.
 
 Supported firmware animations:
 

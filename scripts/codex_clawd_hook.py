@@ -2,8 +2,8 @@
 """Codex hook -> Clawd Mochi Tank animation bridge.
 
 Reads a Codex hook payload from stdin, maps it to an animation, and sends
-an HTTP request to the ESP32 firmware. Failures are best-effort and exit 0 so
-Codex is never interrupted by display/network issues.
+it to the ESP32 firmware by BLE or serial. Failures are best-effort and exit 0
+so Codex is never interrupted by display/network issues.
 """
 
 from __future__ import annotations
@@ -14,16 +14,16 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
-import urllib.parse
 import urllib.request
 from pathlib import Path
 
 
-DEFAULT_URL = "http://192.168.4.1"
 DEFAULT_BAUD = 115200
 DEFAULT_BLE_NAME = "Claude-Mochi-Tank"
 CH340_VID = 0x1A86  # WCH CH340/CH341 USB-serial adapter
+ESPRESSIF_USB_VID = 0x303A
 BLE_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 BLE_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 LOG_DIR = Path.home() / ".clawd-mochi"
@@ -31,9 +31,12 @@ LOG_PATH = LOG_DIR / "status-hook.log"
 LAST_EVENT_PATH = LOG_DIR / "last_event"
 WATCH_PID_PATH = LOG_DIR / "session-watch.pid"
 HUB_PID_PATH = LOG_DIR / "status-hub.pid"
+WATCH_START_LOCK_PATH = LOG_DIR / "session-watch.start.lock"
+HUB_START_LOCK_PATH = LOG_DIR / "status-hub.start.lock"
 DEFAULT_HUB_URL = "http://127.0.0.1:8765"
 DEFAULT_CLIENT_ID = "codex-code"
 NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+SERIAL_LOCK = threading.Lock()
 
 
 def env_float(name: str, default: float) -> float:
@@ -143,6 +146,32 @@ def read_hub_pid() -> int:
         return 0
 
 
+def acquire_start_lock(path: Path, stale_seconds: float = 10.0) -> bool:
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(f"{os.getpid()} {time.time():.6f}\n")
+        return True
+    except FileExistsError:
+        try:
+            if time.time() - path.stat().st_mtime > stale_seconds:
+                path.unlink(missing_ok=True)
+                return acquire_start_lock(path, stale_seconds)
+        except OSError:
+            pass
+        return False
+    except OSError:
+        return False
+
+
+def release_start_lock(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def ensure_session_watcher(args: argparse.Namespace) -> None:
     """Start the session JSONL watcher once, when hook support is available."""
     if os.environ.get("CLAWD_TANK_AUTOSTART_WATCHER", "1").lower() in {"0", "false", "no", "off"}:
@@ -152,41 +181,51 @@ def ensure_session_watcher(args: argparse.Namespace) -> None:
     if pid_is_running(pid):
         log(f"watch already running pid={pid}")
         return
-
-    watcher = Path(__file__).with_name("codex_session_watch.py")
-    if not watcher.exists():
-        log(f"watch autostart skipped; missing {watcher}")
+    if not acquire_start_lock(WATCH_START_LOCK_PATH):
+        time.sleep(0.4)
+        if pid_is_running(read_watcher_pid()):
+            log("watch autostart skipped; another starter won")
+            return
+        log("watch autostart skipped; start lock is active")
         return
 
-    cmd = [sys.executable, str(watcher), "--follow-latest"]
-    if args.transport:
-        cmd += ["--transport", args.transport]
-    if args.port:
-        cmd += ["--port", args.port]
-    if args.baud is not None:
-        cmd += ["--baud", str(args.baud)]
-    if args.ble_address:
-        cmd += ["--ble-address", args.ble_address]
-    if args.ble_name:
-        cmd += ["--ble-name", args.ble_name]
-
-    kwargs: dict = {
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-        "close_fds": True,
-    }
-    if os.name == "nt":
-        kwargs["creationflags"] = 0x00000008 | 0x08000000  # DETACHED_PROCESS | CREATE_NO_WINDOW
-    else:
-        kwargs["start_new_session"] = True
-
     try:
-        proc = subprocess.Popen(cmd, **kwargs)
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        WATCH_PID_PATH.write_text(str(proc.pid), encoding="utf-8")
-        log(f"watch autostarted pid={proc.pid}")
-    except Exception as exc:
-        log(f"watch autostart failed: {exc}")
+        watcher = Path(__file__).with_name("codex_session_watch.py")
+        if not watcher.exists():
+            log(f"watch autostart skipped; missing {watcher}")
+            return
+
+        cmd = [sys.executable, str(watcher), "--follow-latest"]
+        if args.transport:
+            cmd += ["--transport", args.transport]
+        if args.port:
+            cmd += ["--port", args.port]
+        if args.baud is not None:
+            cmd += ["--baud", str(args.baud)]
+        if args.ble_address:
+            cmd += ["--ble-address", args.ble_address]
+        if args.ble_name:
+            cmd += ["--ble-name", args.ble_name]
+
+        kwargs: dict = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "close_fds": True,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = 0x00000008 | 0x08000000  # DETACHED_PROCESS | CREATE_NO_WINDOW
+        else:
+            kwargs["start_new_session"] = True
+
+        try:
+            proc = subprocess.Popen(cmd, **kwargs)
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            WATCH_PID_PATH.write_text(str(proc.pid), encoding="utf-8")
+            log(f"watch autostarted pid={proc.pid}")
+        except Exception as exc:
+            log(f"watch autostart failed: {exc}")
+    finally:
+        release_start_lock(WATCH_START_LOCK_PATH)
 
 
 def hub_url(cli_url: str | None = None) -> str:
@@ -221,44 +260,57 @@ def ensure_hub(args: argparse.Namespace) -> None:
     pid = read_hub_pid()
     if pid_is_running(pid):
         return
-
-    hub = Path(__file__).with_name("clawd_status_hub.py")
-    if not hub.exists():
-        log(f"hub autostart skipped; missing {hub}")
+    if not acquire_start_lock(HUB_START_LOCK_PATH):
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            if ping_hub(args.hub_url):
+                return
+            time.sleep(0.15)
+        log("hub autostart skipped; start lock is active")
         return
-
-    cmd = [sys.executable, str(hub)]
-    if args.transport:
-        cmd += ["--transport", args.transport]
-    if args.port:
-        cmd += ["--serial-port", args.port]
-    if args.baud is not None:
-        cmd += ["--baud", str(args.baud)]
-    if args.ble_address:
-        cmd += ["--ble-address", args.ble_address]
-    if args.ble_name:
-        cmd += ["--ble-name", args.ble_name]
-
-    kwargs: dict = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "close_fds": True}
-    if os.name == "nt":
-        kwargs["creationflags"] = 0x00000008 | 0x08000000
-    else:
-        kwargs["start_new_session"] = True
 
     try:
-        proc = subprocess.Popen(cmd, **kwargs)
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        HUB_PID_PATH.write_text(str(proc.pid), encoding="utf-8")
-        log(f"hub autostarted pid={proc.pid}")
-    except Exception as exc:
-        log(f"hub autostart failed: {exc}")
-        return
-
-    deadline = time.time() + 3.0
-    while time.time() < deadline:
         if ping_hub(args.hub_url):
             return
-        time.sleep(0.15)
+        hub = Path(__file__).with_name("clawd_status_hub.py")
+        if not hub.exists():
+            log(f"hub autostart skipped; missing {hub}")
+            return
+
+        cmd = [sys.executable, str(hub)]
+        if args.transport:
+            cmd += ["--transport", args.transport]
+        if args.port:
+            cmd += ["--serial-port", args.port]
+        if args.baud is not None:
+            cmd += ["--baud", str(args.baud)]
+        if args.ble_address:
+            cmd += ["--ble-address", args.ble_address]
+        if args.ble_name:
+            cmd += ["--ble-name", args.ble_name]
+
+        kwargs: dict = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "close_fds": True}
+        if os.name == "nt":
+            kwargs["creationflags"] = 0x00000008 | 0x08000000
+        else:
+            kwargs["start_new_session"] = True
+
+        try:
+            proc = subprocess.Popen(cmd, **kwargs)
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            HUB_PID_PATH.write_text(str(proc.pid), encoding="utf-8")
+            log(f"hub autostarted pid={proc.pid}")
+        except Exception as exc:
+            log(f"hub autostart failed: {exc}")
+            return
+
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            if ping_hub(args.hub_url):
+                return
+            time.sleep(0.15)
+    finally:
+        release_start_lock(HUB_START_LOCK_PATH)
 
 
 def ping_hub(cli_url: str | None = None) -> bool:
@@ -325,10 +377,6 @@ def deliver_anim(anim: str, args: argparse.Namespace, payload: dict | None = Non
 # Transport helpers
 # ---------------------------------------------------------------------------
 
-def device_url() -> str:
-    return os.environ.get("CLAWD_TANK_URL", DEFAULT_URL).rstrip("/")
-
-
 def transport_name(cli_transport: str | None = None) -> str:
     return (cli_transport or os.environ.get("CLAWD_TANK_TRANSPORT") or "auto").lower()
 
@@ -342,11 +390,11 @@ def transport_list(selected: str) -> list[str]:
     }
     selected = aliases.get(selected, selected)
     if selected == "auto":
-        return ["ble", "serial", "http"]
+        return ["ble", "serial"]
     if selected == "parallel":
-        return ["ble", "serial", "http"]
+        return ["ble", "serial"]
     if "," in selected:
-        return [item.strip().lower() for item in selected.split(",") if item.strip()]
+        return [item.strip().lower() for item in selected.split(",") if item.strip() and item.strip().lower() != "http"]
     return [selected]
 
 
@@ -372,16 +420,68 @@ def port_matches_ch340(info: object) -> bool:
     return any(token in haystack for token in ("CH340", "CH341", "1A86", "USB-SERIAL"))
 
 
-def discover_ch340_port() -> str | None:
-    """Return the serial port field for the first detected CH340/CH341 adapter."""
+def port_score(info: object) -> int:
+    fields = (
+        "device",
+        "name",
+        "description",
+        "hwid",
+        "manufacturer",
+        "product",
+        "interface",
+        "location",
+    )
+    haystack = " ".join(str(getattr(info, field, "") or "") for field in fields).upper()
+    if any(token in haystack for token in ("BLUETOOTH", "STANDARD SERIAL OVER BLUETOOTH")):
+        return 0
+    vid = getattr(info, "vid", None)
+    if vid == CH340_VID or port_matches_ch340(info):
+        return 100
+    if vid == ESPRESSIF_USB_VID:
+        return 95
+    if any(token in haystack for token in ("ESPRESSIF", "ESP32", "USB JTAG", "USB-TO-UART", "USB SERIAL", "USB CDC", "CP210")):
+        return 90
+    return 0
+
+
+def discover_serial_port() -> str | None:
+    """Return the most likely ESP32 serial port, covering CH340 and native USB CDC."""
     try:
         from serial.tools import list_ports  # type: ignore
-        for info in list_ports.comports():
-            if port_matches_ch340(info):
-                return info.device
+        candidates = sorted(
+            ((port_score(info), info.device) for info in list_ports.comports()),
+            reverse=True,
+        )
+        for score, device in candidates:
+            if score > 0:
+                return device
     except Exception:
         pass
     return None
+
+
+def discover_ch340_port() -> str | None:
+    """Backward-compatible alias for serial auto-detection."""
+    return discover_serial_port()
+
+
+def describe_serial_port(port: str | None) -> str:
+    if not port:
+        return "none"
+    return port
+
+
+def wait_for_serial_ready(ser: object, timeout: float = 4.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        raw = ser.readline()
+        if not raw:
+            continue
+        line = raw.decode("utf-8", errors="replace").strip()
+        if line:
+            log(f"serial boot: {line}")
+        if "Clawd Mochi Tank ready" in line or "Serial command examples" in line:
+            return
 
 
 def list_windows_ports() -> list[str]:
@@ -406,10 +506,9 @@ def list_windows_ports() -> list[str]:
 def doctor() -> int:
     print("Clawd transport doctor")
     print(f"default transport: {transport_name()}")
-    print(f"http url: {device_url()}")
 
-    ch340 = discover_ch340_port()
-    print(f"CH340 auto-detect: {ch340 or 'none'}")
+    serial_port = discover_serial_port()
+    print(f"serial auto-detect: {describe_serial_port(serial_port)}")
 
     all_ports = list_windows_ports()
     if all_ports:
@@ -436,25 +535,12 @@ def doctor() -> int:
 # Send helpers
 # ---------------------------------------------------------------------------
 
-def send_anim_http(anim: str) -> bool:
-    base = device_url()
-    # Disable firmware auto-cycle before explicit Codex-driven status.
-    for path in ("/auto?on=0", f"/anim?id={urllib.parse.quote(anim)}"):
-        try:
-            with urllib.request.urlopen(base + path, timeout=0.8) as resp:
-                resp.read(256)
-        except Exception as exc:  # best effort only
-            log(f"send failed anim={anim} path={path}: {exc}")
-            return False
-    log(f"sent http anim={anim}")
-    return True
-
 
 def send_anim_serial(anim: str, port: str | None = None, baud: int | None = None) -> bool:
     serial_port = (
         port
         or os.environ.get("CLAWD_TANK_SERIAL_PORT")
-        or discover_ch340_port()
+        or discover_serial_port()
     )
     if not serial_port:
         log("serial transport selected but no COM port was found; set CLAWD_TANK_SERIAL_PORT/--port")
@@ -466,31 +552,42 @@ def send_anim_serial(anim: str, port: str | None = None, baud: int | None = None
         log("serial transport requires pyserial: python -m pip install pyserial")
         return False
 
-    try:
-        ser = serial.Serial()
-        ser.port = serial_port
-        ser.baudrate = baud or int(os.environ.get("CLAWD_TANK_SERIAL_BAUD", DEFAULT_BAUD))
-        ser.timeout = 0.4
-        ser.rtscts = False
-        ser.dsrdtr = False
-        ser.dtr = False
-        ser.rts = False
-        with ser:
-            ser.dtr = False
-            ser.rts = False
-            ser.write(command_payload(anim).encode("utf-8"))
-            ser.flush()
-            deadline = time.time() + 0.8
-            while time.time() < deadline:
-                line = ser.readline().decode("utf-8", errors="replace").strip()
-                if line.startswith("{") and "\"anim\"" in line:
-                    log(f"serial state port={serial_port}: {line}")
-                    break
-        log(f"sent serial port={serial_port} anim={anim}")
-        return True
-    except Exception as exc:
-        log(f"serial send failed port={serial_port} anim={anim}: {exc}")
-        return False
+    last_exc: Exception | None = None
+    with SERIAL_LOCK:
+        for attempt in range(3):
+            try:
+                ser = serial.Serial()
+                ser.port = serial_port
+                ser.baudrate = baud or int(os.environ.get("CLAWD_TANK_SERIAL_BAUD", DEFAULT_BAUD))
+                ser.timeout = 0.4
+                ser.rtscts = False
+                ser.dsrdtr = False
+                ser.dtr = False
+                ser.rts = False
+                got_ack = False
+                with ser:
+                    ser.dtr = False
+                    ser.rts = False
+                    ser.reset_input_buffer()
+                    wait_for_serial_ready(ser)
+                    ser.write(command_payload(anim).encode("utf-8"))
+                    ser.flush()
+                    deadline = time.time() + 1.5
+                    while time.time() < deadline:
+                        line = ser.readline().decode("utf-8", errors="replace").strip()
+                        if "{" in line and "\"anim\"" in line:
+                            log(f"serial state port={serial_port}: {line}")
+                            got_ack = True
+                            break
+                if got_ack:
+                    log(f"sent serial port={serial_port} anim={anim}")
+                    return True
+                last_exc = TimeoutError("serial command written but no firmware state ack received")
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(0.15 * (attempt + 1))
+    log(f"serial send failed port={serial_port} anim={anim}: {last_exc}")
+    return False
 
 
 async def _send_anim_ble_async(anim: str, address: str | None, name: str) -> bool:
@@ -541,14 +638,12 @@ def send_anim(anim: str, transport: str | None = None, port: str | None = None, 
 
     for item in transports:
         sent = False
-        if item == "http":
-            sent = send_anim_http(anim)
-        elif item == "serial":
+        if item == "serial":
             sent = send_anim_serial(anim, port=port, baud=baud)
         elif item == "ble":
             sent = send_anim_ble(anim, address=ble_address, name=ble_name)
         else:
-            log(f"unknown transport={item!r}; expected http, serial, ble, auto, parallel, or comma list")
+            log(f"unknown transport={item!r}; expected serial, ble, auto, parallel, or comma list")
             continue
 
         sent_any = sent_any or sent
@@ -730,8 +825,8 @@ def main() -> int:
     parser.add_argument("--test", help="send a specific animation and exit")
     parser.add_argument("--doctor", action="store_true", help="show discovered transports and dependencies")
     parser.add_argument("--print-mapping", action="store_true")
-    parser.add_argument("--transport", help="http, serial, ble, auto, parallel/all, or comma list")
-    parser.add_argument("--port", help="optional serial port override; CH340 is auto-detected when omitted")
+    parser.add_argument("--transport", help="serial, ble, auto, parallel/all, or comma list")
+    parser.add_argument("--port", help="optional serial port override; ESP32 serial is auto-detected when omitted")
     parser.add_argument("--baud", type=int, default=None)
     parser.add_argument("--ble-address")
     parser.add_argument("--ble-name", default=None)

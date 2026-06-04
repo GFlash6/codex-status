@@ -14,7 +14,7 @@ SKILL.md
 Codex native hooks and/or Codex session JSONL watcher
   -> codex_clawd_hook.py / codex_session_watch.py
   -> Hook Hub at http://127.0.0.1:8765
-  -> BLE / CH340 serial / HTTP
+  -> BLE / ESP32 serial
   -> ESP32
 ```
 
@@ -24,16 +24,9 @@ Codex native hooks and/or Codex session JSONL watcher
 C:\Python314\python.exe C:\Users\admin\.codex\skills\codex-clawd-status\scripts\install_hooks.py
 ```
 
-The installer writes Codex hooks and creates or updates the Windows Startup
-shortcut `Clawd Hub App.lnk`, which starts `clawd_hub_app.py --minimized` at
-login. Use `--no-startup` if you only want to refresh hook entries.
-
 Then restart Codex and run `/hooks` to review and trust hook definitions.
 
 ## Daily Start
-
-On Windows this is normally automatic after install because the Startup
-shortcut launches the background UI controller at login.
 
 Start the background UI controller:
 
@@ -98,7 +91,7 @@ Invoke-RestMethod http://127.0.0.1:8765/state
 
 ## Notes
 
-- Default transport is `auto`: BLE, then auto-detected CH340/CH341 serial, then HTTP.
-- Serial ports are not fixed; CH340/CH341 is detected from port metadata.
+- Default transport is `auto`: BLE, then auto-detected ESP32 serial.
+- Serial ports are not fixed; CH340/CH341 adapters and native ESP32 USB CDC/JTAG ports are detected from port metadata.
 - Hub localhost requests bypass system proxy settings.
 - Detailed behavior and troubleshooting are in `SKILL.md`.

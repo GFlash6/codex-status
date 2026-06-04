@@ -28,6 +28,7 @@ APP_NAME = "Clawd Hub"
 DEFAULT_HUB_URL = "http://127.0.0.1:8765"
 LOG_DIR = Path.home() / ".clawd-mochi"
 APP_PID_PATH = LOG_DIR / "hub-app.pid"
+HUB_START_LOCK_PATH = LOG_DIR / "status-hub.start.lock"
 SCRIPT_DIR = Path(__file__).resolve().parent
 HUB_SCRIPT = SCRIPT_DIR / "clawd_status_hub.py"
 WATCHER_SCRIPT = SCRIPT_DIR / "codex_session_watch.py"
@@ -55,6 +56,32 @@ def write_pid() -> None:
         pass
 
 
+def acquire_start_lock(path: Path, stale_seconds: float = 10.0) -> bool:
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(f"{os.getpid()} {time.time():.6f}\n")
+        return True
+    except FileExistsError:
+        try:
+            if time.time() - path.stat().st_mtime > stale_seconds:
+                path.unlink(missing_ok=True)
+                return acquire_start_lock(path, stale_seconds)
+        except OSError:
+            pass
+        return False
+    except OSError:
+        return False
+
+
+def release_start_lock(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def http_json(url: str, method: str = "GET", body: dict[str, Any] | None = None, timeout: float = 2.0) -> dict[str, Any]:
     data = None
     headers = {}
@@ -77,39 +104,38 @@ class HubController:
     def modules(self) -> dict[str, Any]:
         return http_json(self.hub_url + "/modules", timeout=2.0)
 
-    def cleanup_duplicate_hubs(self) -> None:
-        if os.name != "nt":
-            return
-        try:
-            script = (
-                "$listener=(Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction SilentlyContinue | "
-                "Select-Object -First 1 -ExpandProperty OwningProcess);"
-                "$hubs=Get-CimInstance Win32_Process | Where-Object { "
-                "$_.Name -eq 'python.exe' -and $_.CommandLine -like '*clawd_status_hub.py*' };"
-                "foreach($h in $hubs){ if($listener -and $h.ProcessId -ne $listener){ "
-                "Stop-Process -Id $h.ProcessId -Force -ErrorAction SilentlyContinue } }"
-            )
-            subprocess.run(
-                ["powershell", "-NoProfile", "-Command", script],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=3.0,
-                check=False,
-            )
-        except Exception:
-            pass
-
     def ensure_hub(self) -> None:
-        self.cleanup_duplicate_hubs()
         try:
             self.health()
             return
         except Exception:
             pass
-        subprocess.Popen(
-            [sys.executable, str(HUB_SCRIPT), "--transport", self.transport],
-            **process_kwargs(),
-        )
+        if not acquire_start_lock(HUB_START_LOCK_PATH):
+            time.sleep(0.5)
+            try:
+                self.health()
+            except Exception:
+                pass
+            return
+        try:
+            try:
+                self.health()
+                return
+            except Exception:
+                pass
+            subprocess.Popen(
+                [sys.executable, str(HUB_SCRIPT), "--transport", self.transport],
+                **process_kwargs(),
+            )
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                try:
+                    self.health()
+                    return
+                except Exception:
+                    time.sleep(0.15)
+        finally:
+            release_start_lock(HUB_START_LOCK_PATH)
 
     def restart_hub(self) -> dict[str, Any]:
         try:
@@ -293,7 +319,7 @@ def status_json(controller: HubController) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--hub-url", default=os.environ.get("CLAWD_TANK_HUB_URL", DEFAULT_HUB_URL))
-    parser.add_argument("--transport", default=os.environ.get("CLAWD_TANK_TRANSPORT", "ble"))
+    parser.add_argument("--transport", default=os.environ.get("CLAWD_TANK_TRANSPORT", "auto"))
     parser.add_argument("--minimized", action="store_true")
     parser.add_argument("--status", action="store_true", help="start/check Hub and print module JSON")
     args = parser.parse_args()

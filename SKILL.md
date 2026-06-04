@@ -13,7 +13,7 @@ Runtime flow:
 Codex native hooks and/or Codex session JSONL watcher
   -> codex_clawd_hook.py / codex_session_watch.py
   -> local Hook Hub at http://127.0.0.1:8765
-  -> BLE Nordic UART / auto-detected CH340 serial / HTTP
+  -> BLE Nordic UART / auto-detected ESP32 serial
   -> ESP32 firmware
 ```
 
@@ -27,8 +27,8 @@ Use this document when installing the skill on a machine, refreshing hook config
   ```powershell
   python -m pip install pyserial bleak
   ```
-- `pyserial` enables CH340/CH341 USB serial auto-detection.
-- `bleak` enables BLE transport. If no Bluetooth adapter is available, `auto` transport falls back to serial and then HTTP.
+- `pyserial` enables ESP32 USB serial auto-detection, including CH340/CH341 adapters and native ESP32 USB CDC/JTAG ports.
+- `bleak` enables BLE transport. If no Bluetooth adapter is available, `auto` transport falls back to serial.
 
 ## Files
 
@@ -83,20 +83,6 @@ Runtime state and logs:
    python skills/codex-clawd-status/scripts/install_hooks.py
    ```
 
-   The installer also creates or updates this Windows Startup shortcut:
-
-   ```text
-   %APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\Clawd Hub App.lnk
-   ```
-
-   The shortcut starts `clawd_hub_app.py --minimized` at login, so Hub and
-   the watcher can stay available in the background. To install hooks without
-   changing Startup entries, run:
-
-   ```powershell
-   python scripts/install_hooks.py --no-startup
-   ```
-
 3. Restart active Codex sessions.
 
 4. In Codex CLI, run:
@@ -114,9 +100,6 @@ Runtime state and logs:
    ```
 
 ## Daily Start
-
-After installation on Windows, the Hub UI controller is started automatically
-at login from the `Clawd Hub App.lnk` Startup shortcut.
 
 The most reliable daily setup is to keep both Hub and watcher running.
 
@@ -256,19 +239,18 @@ Hub localhost calls bypass system HTTP proxy settings so `HTTP_PROXY` and `HTTPS
 Default:
 
 ```text
-auto = BLE -> CH340 serial -> HTTP
+auto = BLE -> ESP32 serial
 ```
 
 Supported values:
 
 ```text
-auto         BLE, then CH340 serial, then HTTP
-parallel     send by BLE, CH340 serial, and HTTP
+auto         BLE, then ESP32 serial
+parallel     send by BLE and ESP32 serial
 bluetooth    alias of ble
 ble          BLE Nordic UART only
-serial       CH340/CH341 USB serial only
-http         HTTP only
-serial,http  custom ordered fallback list
+serial       ESP32 USB serial only
+ble,serial   custom ordered fallback list
 ```
 
 Set transport:
@@ -286,7 +268,7 @@ C:\Python314\python.exe C:\Users\admin\.codex\skills\codex-clawd-status\scripts\
 Serial detection:
 
 - The script scans pyserial port metadata.
-- It matches CH340/CH341 by VID `1A86` or fields containing `CH340`, `CH341`, `USB-SERIAL`, etc.
+- It prefers CH340/CH341, Espressif VID `303A`, and fields containing `ESP32`, `ESPRESSIF`, `USB JTAG`, `USB CDC`, `USB SERIAL`, `USB-SERIAL`, or `CP210`.
 - Do not hard-code COM ports in normal use.
 - Use `CLAWD_TANK_SERIAL_PORT` only as a deliberate override.
 
@@ -300,18 +282,6 @@ TX UUID:      6e400003-b5a3-f393-e0a9-e50e24dcca9e
 ```
 
 BLE payloads are newline-terminated JSON commands.
-
-HTTP fallback default:
-
-```text
-http://192.168.4.1
-```
-
-Override:
-
-```powershell
-$env:CLAWD_TANK_URL = "http://192.168.4.1"
-```
 
 ## Event Mapping
 
@@ -408,8 +378,7 @@ Hub has events but ESP32 does not change:
 1. Open the dashboard and inspect `transport_message`.
 2. If BLE fails but serial succeeds, this is acceptable fallback behavior.
 3. If serial fails, close PlatformIO Serial Monitor or any app holding the COM port.
-4. Replug CH340 USB and rerun `--doctor`.
-5. If using HTTP fallback, connect to the ESP32 AP and check `http://192.168.4.1/state`.
+4. Replug the ESP32 USB cable and rerun `--doctor`.
 
 Events show the wrong Codex source:
 
@@ -429,7 +398,7 @@ C:\Python314\python.exe C:\Users\admin\.codex\skills\codex-clawd-status\scripts\
 - Prefer editing the project copy, then sync to `%USERPROFILE%\.codex\skills\codex-clawd-status`.
 - Keep `codex_clawd_hook.py`, `codex_session_watch.py`, and `clawd_status_hub.py` behavior aligned.
 - If the hook command changes, rerun `scripts/install_hooks.py`, restart Codex, and trust hooks again.
-- Do not make the serial port fixed by default; CH340 auto-detection is intentional.
+- Do not make the serial port fixed by default; ESP32 serial auto-detection is intentional.
 - Keep Hub as the normal path so dashboard state remains accurate.
 
 For lower-level payload assumptions, read `references/hook-mapping.md`.

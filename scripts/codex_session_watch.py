@@ -23,6 +23,7 @@ import codex_clawd_hook as hook
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
 SESSIONS_DIR = CODEX_HOME / "sessions"
 WATCH_PID_PATH = hook.LOG_DIR / "session-watch.pid"
+WATCH_RUN_LOCK_PATH = hook.LOG_DIR / "session-watch.run.lock"
 
 
 def originator_client_id(originator: str, source: str, fallback: str) -> str:
@@ -146,6 +147,37 @@ def write_pid() -> None:
         pass
 
 
+def acquire_run_lock(path: Path, stale_seconds: float = 30.0) -> bool:
+    try:
+        hook.LOG_DIR.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(f"{os.getpid()} {time.time():.6f}\n")
+        return True
+    except FileExistsError:
+        try:
+            parts = path.read_text(encoding="utf-8", errors="replace").split()
+            pid = int(parts[0]) if parts else 0
+            if pid and not hook.pid_is_running(pid):
+                path.unlink(missing_ok=True)
+                return acquire_run_lock(path, stale_seconds)
+            if time.time() - path.stat().st_mtime > stale_seconds:
+                path.unlink(missing_ok=True)
+                return acquire_run_lock(path, stale_seconds)
+        except OSError:
+            pass
+        return False
+    except OSError:
+        return False
+
+
+def release_run_lock(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--session", type=Path, help="session JSONL to follow; defaults to newest")
@@ -163,17 +195,24 @@ def main() -> int:
     parser.add_argument("--client-id", default=os.environ.get("CLAWD_TANK_WATCH_CLIENT_ID", "codex-watch"))
     args = parser.parse_args()
 
-    write_pid()
-    hook.log("watch started")
+    if not acquire_run_lock(WATCH_RUN_LOCK_PATH):
+        hook.log("watch start skipped; run lock is active")
+        return 0
 
-    while True:
-        session = args.session or latest_session_file()
-        if not session:
-            time.sleep(args.poll)
-            continue
-        follow_file(session, args)
-        if args.session:
-            return 0
+    try:
+        write_pid()
+        hook.log("watch started")
+
+        while True:
+            session = args.session or latest_session_file()
+            if not session:
+                time.sleep(args.poll)
+                continue
+            follow_file(session, args)
+            if args.session:
+                return 0
+    finally:
+        release_run_lock(WATCH_RUN_LOCK_PATH)
 
 
 if __name__ == "__main__":
