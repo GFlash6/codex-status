@@ -7,28 +7,82 @@ description: Automatically use this skill whenever the user mentions Codex statu
 
 This skill connects Codex activity to the Clawd Mochi Tank ESP32 display.
 
-Runtime flow:
+---
+
+## Architecture
 
 ```text
-Codex native hooks and/or Codex session JSONL watcher
-  -> codex_clawd_hook.py / codex_session_watch.py
-  -> local Hook Hub at http://127.0.0.1:8765
-  -> BLE Nordic UART / auto-detected ESP32 serial
-  -> ESP32 firmware
+Codex CLI (hooks.json native hooks)          Codex VS Code / Desktop
+  │  10 events: SessionStart,                  │  writes session JSONL to
+  │  UserPromptSubmit, PreToolUse,             │  ~/.codex/sessions/**/*.jsonl
+  │  PermissionRequest, PostToolUse,           │
+  │  PreCompact, PostCompact, Stop,            ▼
+  │  SubagentStart, SubagentStop             codex_session_watch.py
+  │                                            tails newest session file,
+  ▼                                            maps items → animations
+codex_clawd_hook.py
+  reads JSON payload from stdin,
+  maps event+tool → animation name
+  │                                            │
+  └─────────────────┬───────────────────────── ┘
+                    │ POST http://127.0.0.1:8765/hook
+                    ▼
+          clawd_status_hub.py         Hook Hub — receives deliveries,
+                                       records state, drives transport
+                    │
+                    ├─── BLE Nordic UART ──────► ESP32 (Claude-Mochi-Tank)
+                    └─── CH340/ESP32 serial ───► ESP32 (auto-detected)
+
+          clawd_hub_app.py            Background UI controller.
+                                       Keeps Hub and watcher alive,
+                                       restartable from tray/window.
 ```
 
-Use this document when installing the skill on a machine, refreshing hook configuration, starting the daily background processes, or debugging why the dashboard or display does not update.
+Two input paths feed the same Hub:
+
+- **Native hooks** (`codex_clawd_hook.py`) — fired by Codex CLI when
+  `~/.codex/hooks.json` is configured. Client ID: `codex-code`.
+- **Session watcher** (`codex_session_watch.py`) — tails the newest
+  JSONL session file written by Codex VS Code or Codex Desktop.
+  Client ID: `codex-vscode`, `codex-desktop`, or `codex-watch`.
+
+The Hub shares port 8765 with the Claude Code skill. Only one Hub process
+should run at a time regardless of which skill directory it was started from.
+
+---
+
+## Is This Skill For You?
+
+This skill targets **OpenAI Codex CLI** — the tool that stores hook
+configuration in `~/.codex/hooks.json`.
+
+**You are the right agent if:**
+
+- You are Codex CLI (`codex` command), Codex VS Code extension, or Codex Desktop.
+- Your hook config file is `%USERPROFILE%\.codex\hooks.json`.
+
+**You are a different agent if:**
+
+- You are Claude Code → use the `claude-clawd-status` skill instead.
+- You are another LLM tool, CI runner, or custom agent → see
+  [Adapt For Any Agent](#adapt-for-any-agent) at the end of this document.
+
+---
 
 ## Requirements
 
 - ESP32 is flashed with the Clawd Mochi Tank firmware.
 - Python 3.10+ is available. On the current Windows setup this is typically `C:\Python314\python.exe`.
 - Optional but recommended Python packages:
+
   ```powershell
   python -m pip install pyserial bleak
   ```
+
 - `pyserial` enables ESP32 USB serial auto-detection, including CH340/CH341 adapters and native ESP32 USB CDC/JTAG ports.
 - `bleak` enables BLE transport. If no Bluetooth adapter is available, `auto` transport falls back to serial.
+
+---
 
 ## Files
 
@@ -63,6 +117,8 @@ Runtime state and logs:
 %USERPROFILE%\.clawd-mochi\session-watch.pid
 ```
 
+---
+
 ## Install Or Update
 
 1. Copy or install this skill into:
@@ -77,15 +133,18 @@ Runtime state and logs:
    C:\Python314\python.exe C:\Users\admin\.codex\skills\codex-clawd-status\scripts\install_hooks.py
    ```
 
-   From the project checkout, use:
+   From the project checkout:
 
    ```powershell
    python skills/codex-clawd-status/scripts/install_hooks.py
    ```
 
-3. Restart active Codex sessions.
+3. The installer immediately launches `clawd_hub_app.py --minimized` in the
+   background. The Hub and session watcher start automatically from there.
 
-4. In Codex CLI, run:
+4. Restart active Codex sessions.
+
+5. In Codex CLI, run:
 
    ```text
    /hooks
@@ -93,15 +152,18 @@ Runtime state and logs:
 
    Review and trust the hook command. Codex may ask for trust again whenever the command path changes.
 
-5. Verify `~/.codex/hooks.json` contains commands pointing at:
+6. Verify `~/.codex/hooks.json` contains commands pointing at:
 
    ```text
    %USERPROFILE%\.codex\skills\codex-clawd-status\scripts\codex_clawd_hook.py
    ```
 
+---
+
 ## Daily Start
 
-The most reliable daily setup is to keep both Hub and watcher running.
+The most reliable daily setup is to keep both Hub and watcher running
+before opening Codex. Start the UI controller first — it manages both.
 
 Start the background UI controller:
 
@@ -116,7 +178,7 @@ Start-Process -FilePath "C:\Python314\python.exe" `
 
 The UI controller keeps Hub and the Codex watcher alive, shows module status,
 opens the dashboard, and can restart Hub, watcher, or BLE from a small window.
-If `pystray` is installed it can stay in the Windows system tray; without
+If `pystray` is installed it stays in the Windows system tray; without
 `pystray` it falls back to Tkinter minimize behavior.
 
 Start the Hub:
@@ -130,7 +192,7 @@ Start-Process -FilePath "C:\Python314\python.exe" `
   -WindowStyle Hidden
 ```
 
-Start the session watcher:
+Start the session watcher (required for VS Code / Desktop sessions):
 
 ```powershell
 Start-Process -FilePath "C:\Python314\python.exe" `
@@ -147,12 +209,11 @@ Open the dashboard:
 http://127.0.0.1:8765
 ```
 
-The hook script can also auto-start both pieces:
+Important limitation: if a Codex host never invokes native hooks, it cannot
+trigger watcher autostart. Start `codex_session_watch.py --follow-latest`
+manually for that host.
 
-- `codex_clawd_hook.py` calls `ensure_hub()` before delivering to Hub.
-- `codex_clawd_hook.py` calls `ensure_session_watcher()` after it receives a real native hook payload.
-
-Important limitation: if a Codex host never invokes native hooks, it cannot trigger watcher autostart. Start `codex_session_watch.py --follow-latest` manually for that host.
+---
 
 ## Trigger Flow
 
@@ -205,6 +266,8 @@ Override the watcher fallback id:
 $env:CLAWD_TANK_WATCH_CLIENT_ID = "my-codex-watch"
 ```
 
+---
+
 ## Hook Hub
 
 Default Hub URL:
@@ -217,7 +280,7 @@ Endpoints:
 
 ```text
 /        dashboard
-/hook    hook/event intake
+/hook    hook/event intake  (POST JSON — see below)
 /send    manual animation command
 /state   current state JSON
 /events  recent event history JSON
@@ -232,7 +295,28 @@ The Hub records:
 - transport result
 - recent event history
 
-Hub localhost calls bypass system HTTP proxy settings so `HTTP_PROXY` and `HTTPS_PROXY` do not break `127.0.0.1:8765`.
+Hub localhost calls bypass system HTTP proxy settings so `HTTP_PROXY` and
+`HTTPS_PROXY` do not break `127.0.0.1:8765`.
+
+### POST /hook payload
+
+```json
+{
+  "anim":        "thinking",
+  "client_id":   "codex-code",
+  "client_kind": "codex",
+  "event":       "PreToolUse",
+  "tool":        "shell_command"
+}
+```
+
+Only `anim` is required. All other fields are optional metadata shown on
+the dashboard. `anim` must be one of:
+`idle` `thinking` `typing` `building` `debugger` `wizard`
+`conducting` `juggling` `confused` `sweeping` `happy`
+`sleeping` `beacon` `alert` `dizzy`
+
+---
 
 ## Transport
 
@@ -246,7 +330,7 @@ Supported values:
 
 ```text
 auto         BLE, then ESP32 serial
-parallel     send by BLE and ESP32 serial
+parallel     send by BLE and ESP32 serial simultaneously
 bluetooth    alias of ble
 ble          BLE Nordic UART only
 serial       ESP32 USB serial only
@@ -283,6 +367,8 @@ TX UUID:      6e400003-b5a3-f393-e0a9-e50e24dcca9e
 
 BLE payloads are newline-terminated JSON commands.
 
+---
+
 ## Event Mapping
 
 Default mapping:
@@ -317,12 +403,14 @@ happy -> idle -> sleeping
 Customize before starting Codex:
 
 ```powershell
-$env:CLAWD_TANK_COMPLETE_ANIM = "happy"
-$env:CLAWD_TANK_IDLE_ANIM = "idle"
-$env:CLAWD_TANK_SLEEP_ANIM = "sleeping"
+$env:CLAWD_TANK_COMPLETE_ANIM    = "happy"
+$env:CLAWD_TANK_IDLE_ANIM        = "idle"
+$env:CLAWD_TANK_SLEEP_ANIM       = "sleeping"
 $env:CLAWD_TANK_COMPLETE_SECONDS = "10"
-$env:CLAWD_TANK_IDLE_SECONDS = "30"
+$env:CLAWD_TANK_IDLE_SECONDS     = "30"
 ```
+
+---
 
 ## Test
 
@@ -348,7 +436,8 @@ Check running processes:
 
 ```powershell
 Get-CimInstance Win32_Process |
-  Where-Object { $_.CommandLine -like '*clawd_status_hub.py*' -or $_.CommandLine -like '*codex_session_watch.py*' } |
+  Where-Object { $_.CommandLine -like '*clawd_status_hub.py*' `
+              -or $_.CommandLine -like '*codex_session_watch.py*' } |
   Select-Object ProcessId, CommandLine
 ```
 
@@ -360,14 +449,18 @@ Invoke-RestMethod http://127.0.0.1:8765/state
 Invoke-RestMethod http://127.0.0.1:8765/events
 ```
 
+---
+
 ## Troubleshooting
 
 Hub page has no events:
 
 1. Check Hub is running:
+
    ```powershell
    Invoke-RestMethod http://127.0.0.1:8765/health
    ```
+
 2. Check watcher is running for VS Code/Desktop sessions.
 3. Check `~/.codex/hooks.json` points to the installed `codex_clawd_hook.py`.
 4. Restart Codex and trust hooks with `/hooks`.
@@ -393,9 +486,108 @@ Disable Hub for direct transport debugging:
 C:\Python314\python.exe C:\Users\admin\.codex\skills\codex-clawd-status\scripts\codex_clawd_hook.py --test typing --no-hub --transport serial
 ```
 
-## Maintenance Notes For Codex
+---
 
-- Prefer editing the project copy, then sync to `%USERPROFILE%\.codex\skills\codex-clawd-status`.
+## Adapt For Any Agent
+
+If you are not Codex but want your agent's activity to appear on the
+Clawd display, you only need to POST to the Hub. No hook scripts or
+`install_hooks.py` are required.
+
+### Step 1 — Ensure the Hub is running
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8765/health
+# expects: {"ok": true, "pid": ...}
+```
+
+If it is not running:
+
+```powershell
+Start-Process -FilePath "C:\Python314\python.exe" `
+  -ArgumentList @(
+    "C:\Users\admin\.codex\skills\codex-clawd-status\scripts\clawd_status_hub.py",
+    "--transport", "auto"
+  ) -WindowStyle Hidden
+```
+
+### Step 2 — POST an animation to the Hub
+
+PowerShell:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8765/hook -Method Post `
+  -ContentType "application/json" `
+  -Body '{"anim":"thinking","client_id":"my-agent","event":"WorkStarted"}'
+```
+
+Python:
+
+```python
+import json, urllib.request
+body = json.dumps({"anim": "thinking", "client_id": "my-agent", "event": "WorkStarted"}).encode()
+req = urllib.request.Request(
+    "http://127.0.0.1:8765/hook", data=body,
+    headers={"Content-Type": "application/json"},
+)
+urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=3)
+```
+
+### Step 3 — Write a hook shim for your platform
+
+```python
+#!/usr/bin/env python3
+"""Minimal hook shim — adapt event names and client_id for your agent."""
+import json, sys, urllib.request
+
+# Map your platform's event names to Clawd animations.
+# Adjust this table to match your agent's event vocabulary.
+EVENT_TO_ANIM = {
+    "work_start": "thinking",
+    "tool_use":   "building",
+    "edit_file":  "typing",
+    "read_file":  "debugger",
+    "web_fetch":  "wizard",
+    "task_done":  "happy",
+    "error":      "dizzy",
+}
+
+def post(anim: str, event: str = "", tool: str = "") -> None:
+    body = json.dumps({"anim": anim, "client_id": "my-agent",
+                       "event": event, "tool": tool}).encode()
+    req = urllib.request.Request(
+        "http://127.0.0.1:8765/hook", data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        opener.open(req, timeout=3)
+    except Exception:
+        pass  # never block the agent
+
+try:
+    payload = json.loads(sys.stdin.read())
+    anim = EVENT_TO_ANIM.get(payload.get("event", ""), "thinking")
+    post(anim, event=payload.get("event", ""), tool=payload.get("tool", ""))
+except Exception:
+    pass
+```
+
+The key contract: always exit 0, never let display failures block the agent.
+
+If your platform does not support stdin-based hooks, read event context from
+env vars, argv, or a temp file and build the same POST body.
+
+### Step 4 — Verify on the dashboard
+
+Open `http://127.0.0.1:8765` and confirm your `client_id` appears in
+the Clients table and animations change when your agent is active.
+
+---
+
+## Maintenance Notes
+
+- Prefer editing the project copy (`skills/codex-clawd-status/`), then sync to `%USERPROFILE%\.codex\skills\codex-clawd-status`.
 - Keep `codex_clawd_hook.py`, `codex_session_watch.py`, and `clawd_status_hub.py` behavior aligned.
 - If the hook command changes, rerun `scripts/install_hooks.py`, restart Codex, and trust hooks again.
 - Do not make the serial port fixed by default; ESP32 serial auto-detection is intentional.
